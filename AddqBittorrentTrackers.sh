@@ -31,6 +31,7 @@ auto_tor_grab=0
 test_in_progress=0
 applytheforce=0
 all_torrent=0
+category_instead=0
 
 if [[ -z $jq_executable ]]; then
 	echo -e "\n\e[0;91;1mFail on jq. Aborting.\n\e[0m"
@@ -56,7 +57,7 @@ generate_trackers_list () {
 		tmp_trackers_list+=$'\n'
 	done
 
-	trackers_list=$(echo "$tmp_trackers_list" | tr ' ' '\n' | awk '{if ($0 && !a[$0]++) print($0 "\n")}')
+	trackers_list=$(echo "$tmp_trackers_list" | awk '{for (i=1;i<=NF;i++) if (!a[$i]++) printf("%s%s",$i,FS)}{printf("\n")}' | xargs | tr ' ' '\n')
 	if [[ $? -ne 0 ]]; then
 		echo "I can't download the list, I'll use a static one"
 cat >"${trackers_list}" <<'EOL'
@@ -125,9 +126,7 @@ EOL
 }
 
 inject_trackers () {
-	echo -ne "\e[0;36;1mInjecting... \e[0;36m"
 	if [[ $clean_existing_trackers == true ]]; then
-		echo -e " \e[32mBut before a quick cleaning the existing trackers... "
 		torrent_urls=$(echo "$qbt_cookie" | $curl_executable --silent --fail --show-error \
 				--cookie - \
 				--request GET "${qbt_host}:${qbt_port}/api/v2/torrents/trackers?hash=${1}" | $jq_executable --raw-output '.[] | .url' \
@@ -135,15 +134,24 @@ inject_trackers () {
 		remove_trackers $1 "$torrent_urls"
 	fi
 
-	# Merge tracker URLs separated by %0A.
-	urls=${trackers_list//$'\n'/%0A}
+	start=1
+	while read tracker; do
+		if [ -n "$tracker" ]; then
+			echo -ne "\e[0;36;1m$start/$number_of_trackers_in_list - Adding tracker $tracker\e[0;36m"
+			echo "$qbt_cookie" | $curl_executable --silent --fail --show-error \
+				-d "hash=${1}&urls=${tracker}" \
+				--cookie - \
+				--request POST "${qbt_host}:${qbt_port}/api/v2/torrents/addTrackers"
 
-	echo "$qbt_cookie" | $curl_executable --silent --fail --show-error \
-		-d "hash=${1}&urls=$urls" \
-		--cookie - \
-		--request POST "${qbt_host}:${qbt_port}/api/v2/torrents/addTrackers"
-
-	echo -e "\e[32mdone, injected $(( (number_of_trackers_in_list + 1) / 2 )) trackers!"
+			if [ $? -eq 0 ]; then
+				echo -e " -> \e[32mSuccess! "
+			else
+				echo -e " - \e[31m< Failed > "
+			fi
+		fi
+		start=$((start+1))
+	done <<< "$trackers_list"
+	echo "Done!"
 }
 
 get_torrent_list () {
@@ -205,8 +213,13 @@ if [ -t 1 ] || [[ "$PWD" == *qbittorrent* ]] ; then
 		echo "Don't use only -f, you need to specify also the torrent!"
 		exit
 	fi
+	
+	if [ $# -eq 1 ] && [ $1 == "-s" ]; then
+		echo "Don't use only -s, you need to specify also the torrent!"
+		exit
+	fi
 
-	while getopts ":acflhn:" opt; do
+	while getopts ":acfslhn:" opt; do
 		case ${opt} in
 			a ) # If used inject trackers to all torrent.
 				all_torrent=1
@@ -216,6 +229,9 @@ if [ -t 1 ] || [[ "$PWD" == *qbittorrent* ]] ; then
 				;;
 			f ) # If used force the injection also in private trackers.
 				applytheforce=1
+				;;
+			s ) # If used with -n option search through save_path (i.e. torrent category) instead of names.
+				category_instead=1
 				;;
 			l ) # Print the list of the torrent where you can inject trackers.
 				get_torrent_list
@@ -231,7 +247,7 @@ if [ -t 1 ] || [[ "$PWD" == *qbittorrent* ]] ; then
 				exit 0
 				;;
 			\? )
-				echo "Unknow option: -${OPTARG}" 1>&2
+				echo "Unknown option: -${OPTARG}" 1>&2
 				exit 1
 				;;
 			h | * ) # Display help.
@@ -239,6 +255,7 @@ if [ -t 1 ] || [[ "$PWD" == *qbittorrent* ]] ; then
 				echo "$0 -a	Inject trackers to all torrent in qBittorrent, this not require any extra information"
 				echo "$0 -c	Clean all the existing trackers before the injection, this not require any extra information"
 				echo "$0 -f	Force the injection of the trackers inside the private torrent too, this not require any extra information"
+				echo "$0 -s	Change -n option to search through save_path (i.e. category) instead of name"
 				echo "$0 -l	Print the list of the torrent where you can inject trackers, this not require any extra information"
 				echo "$0 -n	Specify the torrent name or part of it, for example -n foo or -n 'foo bar'"
 				echo "$0 -h	Display this help"
@@ -309,7 +326,12 @@ elif [ $auto_tor_grab -eq 0 ]; then # manual run
 		done < <(echo $torrent_list | $jq_executable --raw-output '.[] | .hash')
 	else
 		for i in "${tor_arg_names[@]}"; do
-			torrent_name_list=$(echo "$torrent_list" | $jq_executable --raw-output --arg tosearch "$i" '.[] | select(.name | ascii_downcase | contains($tosearch | ascii_downcase)) .name') #possible fix for ONIGURUMA regex libary
+
+            if [ $category_instead -eq 1 ]; then
+			    torrent_name_list=$(echo "$torrent_list" | $jq_executable --raw-output --arg tosearch "$i" '.[] | select(if (.save_path | endswith("complete")) then "uncategorized" else .save_path end | ascii_downcase | contains($tosearch | ascii_downcase)) .name') 
+			else
+			    torrent_name_list=$(echo "$torrent_list" | $jq_executable --raw-output --arg tosearch "$i" '.[] | select(.name | ascii_downcase | contains($tosearch | ascii_downcase)) .name') #possible fix for ONIGURUMA regex libary
+			fi
 
 			if [ -n "$torrent_name_list" ]; then # not empty
 				torrent_name_check=1
@@ -320,8 +342,12 @@ elif [ $auto_tor_grab -eq 0 ]; then # manual run
 				torrent_name_check=0
 			fi
 
-			if [ $torrent_name_check -eq 0 ]; then
-				echo -e "\e[0;31;1mI didn't find a torrent with the text: \e[21m$i\e[0m"
+			if [ $torrent_name_check -eq 0 ] && [ $category_instead -eq 1 ]; then
+				echo -e "\e[0;31;1mI didn't find a torrent with the category: \e[21m$i\e[0m"
+				shift
+				continue
+			elif [ $torrent_name_check -eq 0 ]; then
+				echo -e "\e[0;31;1mI didn't find a torrent with the name: \e[21m$i\e[0m"
 				shift
 				continue
 			else
